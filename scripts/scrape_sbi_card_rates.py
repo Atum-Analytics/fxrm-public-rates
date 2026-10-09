@@ -45,22 +45,135 @@ try:
 except ImportError:
     print("ERROR: pdfplumber not installed. Add it to requirements.txt or workflow setup.", file=sys.stderr)
     sys.exit(1)
+import urllib.parse
 
 SBI_URL = "https://sbi.bank.in/documents/16012/1400784/FOREX_CARD_RATES.pdf"
+# Known SBI PDF locations tried in order. Added as SBI restructures their site
+# every 1-2 years — recent change: sbi.co.in -> sbi.bank.in.
+SBI_FALLBACK_URLS = [
+    "https://sbi.bank.in/documents/16012/1400784/FOREX_CARD_RATES.pdf",
+    "https://sbi.co.in/documents/16012/1400784/FOREX_CARD_RATES.pdf",
+    "https://bank.sbi/documents/16012/1400784/FOREX_CARD_RATES.pdf",
+    "https://sbi.bank.in/documents/16012/1400784/forex.PDF",
+    "https://sbi.co.in/web/business/forex-services/forex-card-rates",
+]
 UA = "Mozilla/5.0 (compatible; FXRM-RateBot/2.3; +https://fxrm-ai-dashboard.azurewebsites.net)"
 PDF_PATH = Path("/tmp/sbi_forex_card_rates.pdf")
+
+
+def _fetch_html(url: str) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept": "text/html",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def search_sbi_pdf_url(query: str = "STATE BANK OF INDIA FOREX CARD RATES") -> list[str]:
+    """Last-resort fallback: when all hardcoded URLs 404, search the open web
+    for the current SBI forex-card-rate PDF location.
+
+    Tries DuckDuckGo first, then Bing. Both return HTML pages where SBI PDF
+    URLs appear either directly or wrapped in redirect links.
+    Returns up to 5 PDF candidates ranked by path specificity.
+    """
+    candidates: list[str] = []
+
+    for engine_name, engine_url_tpl in (
+        ("duckduckgo", "https://duckduckgo.com/html/?q={}"),
+        ("bing",       "https://www.bing.com/search?q={}"),
+    ):
+        try:
+            url = engine_url_tpl.format(urllib.parse.quote(query))
+            html = _fetch_html(url)
+        except Exception as e:
+            print(f"[search:{engine_name}] failed: {e}", file=sys.stderr)
+            continue
+
+        # (a) Direct SBI/bank.sbi/sbi.co.in URLs embedded in result markup
+        for m in re.finditer(
+            r'https?://(?:sbi\.bank\.in|sbi\.co\.in|bank\.sbi)/[^\s"\'<>]+?\.(?:pdf|PDF)',
+            html,
+        ):
+            u = m.group(0)
+            if u not in candidates:
+                candidates.append(u)
+
+        # (b) DuckDuckGo redirect wrapper: /l/?uddg=<url-encoded-target>
+        for m in re.finditer(r'/l/\?uddg=([^"&]+)', html):
+            try:
+                target = urllib.parse.unquote(m.group(1))
+                if re.match(r"^https?://(sbi\.bank\.in|sbi\.co\.in|bank\.sbi)", target):
+                    if target.lower().endswith(".pdf") and target not in candidates:
+                        candidates.append(target)
+            except Exception:
+                pass
+
+        if candidates:
+            print(f"[search:{engine_name}] found {len(candidates)} candidate(s)", file=sys.stderr)
+            break  # don't hit the next engine if we already have something
+
+    # Rank: prefer URLs with 'forex' + 'card' + 'rate' in the path (most specific)
+    def score(u: str) -> int:
+        s = u.lower()
+        return (
+            (2 if "forex" in s else 0)
+            + (2 if "card" in s else 0)
+            + (1 if "rate" in s else 0)
+            + (1 if "sbi.bank.in" in s else 0)  # most recent domain
+        )
+
+    candidates.sort(key=score, reverse=True)
+    return candidates[:5]
 
 # Currencies published per 100 units in the SBI PDF — the quoted rate is for
 # 100 units, so divide by 100 to get a per-unit rate.
 PER_100_CODES = {"JPY", "THB", "KRW", "VND", "IDR"}
 
 
-def fetch_pdf() -> Path:
-    req = urllib.request.Request(SBI_URL, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        PDF_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PDF_PATH.write_bytes(r.read())
-    return PDF_PATH
+def fetch_pdf() -> tuple[Path, str]:
+    """Try known SBI PDF locations in order, then fall back to internet search
+    when the hardcoded list fails. Returns (local_path, source_url) when any
+    attempt yields a valid PDF ≥ 10 KB.
+    """
+    PDF_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    def _try(url: str) -> bool:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = r.read()
+            if len(body) < 10_000:
+                return False
+            # Verify PDF magic header
+            if not body[:4] == b"%PDF":
+                return False
+            PDF_PATH.write_bytes(body)
+            return True
+        except Exception:
+            return False
+
+    # 1. Hardcoded candidates (most reliable path on happy days)
+    for url in SBI_FALLBACK_URLS:
+        print(f"[fetch] try {url}", file=sys.stderr)
+        if _try(url):
+            print(f"[fetch] OK  {url}  ({PDF_PATH.stat().st_size:,} bytes)", file=sys.stderr)
+            return PDF_PATH, url
+
+    # 2. Last resort: search the open web for the current PDF location
+    print("[fetch] all hardcoded URLs failed; searching DuckDuckGo…", file=sys.stderr)
+    candidates = search_sbi_pdf_url()
+    print(f"[fetch] search found {len(candidates)} candidate(s): {candidates}", file=sys.stderr)
+    for url in candidates:
+        if _try(url):
+            print(f"[fetch] OK via search: {url}", file=sys.stderr)
+            return PDF_PATH, url
+
+    raise RuntimeError("Could not locate SBI Forex Card Rates PDF via any known URL or search fallback.")
 
 
 def parse_pdf(path: Path) -> dict:
@@ -120,7 +233,7 @@ def parse_pdf(path: Path) -> dict:
 
 def main() -> int:
     try:
-        fetch_pdf()
+        _, resolved_url = fetch_pdf()
     except Exception as e:
         print(f"ERROR fetching PDF: {e}", file=sys.stderr)
         return 1
@@ -138,7 +251,8 @@ def main() -> int:
     now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     payload = {
         "scrapedAt": now_utc,
-        "sourceUrl": SBI_URL,
+        "sourceUrl": resolved_url,
+        "sourceUrlDiscoveredByFallback": resolved_url != SBI_URL,
         "sbiPublishedDate": parsed["date"],
         "sbiPublishedTime": parsed["time"],
         "currencyCount": len(parsed["currencies"]),
