@@ -1,0 +1,12 @@
+{
+  "scrapedAt": "2026-10-09T00:00:00Z",
+  "asOf": "2026-10-09T00:00:00Z",
+  "scrapedFrom": "SEED",
+  "rates": {
+    "USD": 96.4486,
+    "EUR": 108.3701,
+    "GBP": 128.4200,
+    "JPY": 0.6512
+  },
+  "_note": "Seed file for bootstrap. First GitHub Actions scrape will overwrite with real FBIL/RBI data on next scheduled run."
+}
